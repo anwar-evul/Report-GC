@@ -1,0 +1,438 @@
+
+
+import pandas as pd
+import numpy as np
+import datetime
+import calendar
+import os
+import glob
+import xlwings as xw
+from datetime import date, datetime, timedelta
+from dateutil.relativedelta import relativedelta
+
+#Excel templating
+from openpyxl import Workbook
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+
+#%% variable time
+
+today = date.today() #- timedelta(5)
+yesterday = today - timedelta (1)
+
+month1 = (yesterday - relativedelta(months=1))
+
+m1 = yesterday.strftime("%m")
+m = yesterday.strftime("%b")
+yr = yesterday.strftime("%y")
+yr_ = yesterday.strftime("%Y")
+
+start_dt  = yesterday.replace(day = 1)
+end_dt    = yesterday.replace(day = calendar.monthrange(yesterday.year, yesterday.month)[1])
+
+
+#%% load data analytic cif
+
+cif_phone = pd.read_pickle(r"\\10.232.27.11\cctr$\Report\00. Data Source\DATASET_SAS_OFFLOAD\COMPRESS\FC\CIF_MOBILE_PHONE_" + yesterday.strftime("%b%Y") + ".pkl", compression="zip")
+# cif_phone = pd.read_pickle(r"\\10.232.27.11\cctr$\Report\00. Data Source\DATASET_SAS_OFFLOAD\COMPRESS\FC\CIF_MOBILE_PHONE_Aug2024.pkl", compression="zip")
+cif_phone['mobile_phone'] = cif_phone['mobile_phone'].str.replace(")" , "")
+cif_phone['mobile_phone'] = cif_phone['mobile_phone'].str.replace("+62(" , "")
+cif_phone = cif_phone.loc[~cif_phone['mobile_phone'].isna()]
+
+
+#%% load data delivery tracker
+
+vardate = "*" + yesterday.strftime("%Y%m") +"*" + ".xlsx"
+
+# os.chdir(r'C:\Users\muhammad1\DBS Bank Ltd\Ros Pretty Wakkary - DATA STAGGING SERVER GC CARD DELIVERY/' + yesterday.strftime("%b %Y") + '/')
+# file = os.listdir(r'C:\Users\muhammad1\DBS Bank Ltd\Ros Pretty Wakkary - DATA STAGGING SERVER GC CARD DELIVERY/' + yesterday.strftime("%b %Y") + '/')
+
+os.chdir(r'C:\Users\cctrmis\DBS Bank Ltd\Ros Pretty Wakkary - DATA STAGGING SERVER GC CARD DELIVERY/' + yesterday.strftime("%b %Y") + '/')
+file = os.listdir(r'C:\Users\cctrmis\DBS Bank Ltd\Ros Pretty Wakkary - DATA STAGGING SERVER GC CARD DELIVERY/' + yesterday.strftime("%b %Y") + '/')
+
+card_delivery_tracker = pd.DataFrame(dtype = str)
+
+for i in glob.glob(vardate):
+    print (i)
+    tracker = pd.read_excel(i, dtype = str)
+    card_delivery_tracker = pd.concat([card_delivery_tracker,tracker],axis = 0)
+
+card_delivery_tracker = card_delivery_tracker.loc[card_delivery_tracker['STATUSUPDATE'] == "WKI-1ST DEL"]
+card_delivery_tracker = card_delivery_tracker.loc[~card_delivery_tracker['CARDNO'].isna()]
+
+
+#%% load data gc
+
+vardate = "*" + yesterday.strftime("%Y-%m") +"*" + ".xlsx"
+
+os.chdir('//10.232.27.11/cctr$/Report/00. Data Source/08. GC/')
+file = os.listdir('//10.232.27.11/cctr$/Report/00. Data Source/08. GC/')
+
+gc_all = pd.DataFrame(dtype = str)
+
+for i in glob.glob(vardate):
+    print (i)
+    gc = pd.read_excel(i, dtype = str)
+    gc_all = pd.concat([gc_all,gc],axis = 0)
+
+
+# column cc number
+gc_all["cc_number"] = np.where(gc_all["requestText"].str.contains("Select"),gc_all["requestText"].str[7:23],"")
+
+# column cif
+gc_all = gc_all.reset_index()
+gc_all = gc_all.index.to_frame(name='uniqueall').join(gc_all)
+gc_all = pd.merge(gc_all, cif_phone, how ='left', left_on ='region', right_on = 'mobile_phone')
+
+gc_all = gc_all.drop_duplicates(subset=['uniqueall'], keep= "first")
+gc_all = gc_all.drop(columns=['index','uniqueall','mobile_phone'])
+
+
+#%% gc delivery
+
+gc_delivery = gc_all.loc[gc_all['intent'].str.contains("_DELIVERYSTATUS|_GC_CARDDELIVERY")]
+
+gc_delivery["responseText"] = gc_delivery["responseText"].str.lower()
+gc_delivery["flag"] = np.where(gc_delivery["intent"].str.contains("_CC_") & gc_delivery["requestText"].str.contains("id_CC_DeliveryStatus_fd") & gc_delivery["responseText"].str.contains("silakan pilih nomor kartu dibawah ini"),"CC Delivery has product",
+                      np.where(gc_delivery["intent"].str.contains("_CC_") & gc_delivery["requestText"].str.contains("id_CC_DeliveryStatus_fd") & gc_delivery["responseText"].str.contains("maaf untuk saat ini kamu belum memiliki produk tersebut"),"CC Delivery has no product",
+                      np.where(gc_delivery["intent"].str.contains("_CL_") & gc_delivery["requestText"].str.contains("_DeliveryStatus_fd") & gc_delivery["responseText"].str.contains("silakan pilih nomor kartu dibawah ini"),"CL Delivery has product",
+                      np.where(gc_delivery["intent"].str.contains("_CL_") & gc_delivery["requestText"].str.contains("_DeliveryStatus_fd") & gc_delivery["responseText"].str.contains("maaf untuk saat ini kamu belum memiliki produk tersebut"),"CL Delivery has no product",
+                      np.where(gc_delivery["intent"].str.contains("_DC_") & gc_delivery["requestText"].str.contains("_DeliveryStatus_fd") & gc_delivery["responseText"].str.contains("silakan pilih nomor kartu dibawah ini"),"DC Delivery has product",
+                      np.where(gc_delivery["intent"].str.contains("_DC_") & gc_delivery["requestText"].str.contains("_DeliveryStatus_fd") & gc_delivery["responseText"].str.contains("informasi yang kamu butuhkan belum tersedia"),"DC Delivery has no product",
+                               ""))))))
+
+gc_delivery = gc_delivery.index.to_frame(name='uniquedelivery').join(gc_delivery)
+gc_delivery = pd.merge(gc_delivery, card_delivery_tracker[["CARDNO","STATUSDATE"]], how ='left', left_on ='cc_number', right_on = 'CARDNO')
+gc_delivery = gc_delivery.drop_duplicates(subset=['uniquedelivery'], keep= "first")
+gc_delivery = gc_delivery.drop(columns=['CARDNO','uniquedelivery'])
+
+
+# gc delivery summary
+gc_delivery_user_id = gc_delivery.groupby(['userId'])[['userId']].count()
+gc_delivery_user_id_count = len(gc_delivery_user_id)
+
+gc_delivery_session_id = gc_delivery.groupby(['sessionId'])[['sessionId']].count()
+gc_delivery_session_id_count = len(gc_delivery_session_id)
+
+gc_delivery_transcript = gc_delivery['sessionId']
+gc_delivery_transcript_count = len(gc_delivery_transcript)
+
+gc_delivery_flag = gc_delivery[["flag","sessionId"]]
+gc_delivery_flag = gc_delivery_flag.loc[gc_delivery_flag.flag != ""]
+gc_delivery_flag = gc_delivery_flag.groupby(['flag']).count()
+gc_delivery_flag = gc_delivery_flag.reset_index()
+gc_delivery_flag = gc_delivery_flag.rename(columns = {'flag': 'Delivery','sessionId':'Vol'})
+
+gc_delivery_flag_sum = gc_delivery_flag["Vol"].sum()
+
+gc_delivery_summary = {'Delivery': ["Customer ID","Session ID","Total Transcript","GC Attempt"], 'Vol' : [gc_delivery_user_id_count,
+                                                                           gc_delivery_session_id_count,
+                                                                           gc_delivery_transcript_count,
+                                                                           gc_delivery_flag_sum]}
+gc_delivery_summary = pd.DataFrame(data=gc_delivery_summary)
+gc_delivery_summary_final = pd.concat([gc_delivery_summary,gc_delivery_flag], ignore_index=True)
+
+
+#%% gc inquiry
+
+gc_inquiry = gc_all.loc[gc_all['intent'].str.contains("_GC_CARDINQUIRY|_AVAILABLELIMIT|_PERSONALLOANSTATUS|_CCSTATUSFINAL|_CLSTATUSFINAL")]
+
+gc_inquiry["flag"] = np.where(gc_inquiry["intent"].str.contains("ID_AVAILABLELIMITCC2") & gc_inquiry["requestText"].str.contains("START_KAI_GC"),"CC Card Status",
+                     np.where(gc_inquiry["intent"].str.contains("ID_CCSTATUSFINAL") & gc_inquiry["requestText"].str.contains("id_CCStatusFinal_fd"),"CC Card Status",
+                     np.where(gc_inquiry["intent"].str.contains("ID_AVAILABLELIMITCC2|ID_CCSTATUSFINAL") & gc_inquiry["requestText"].str.contains("Informasi tagihan|Total pemakaian dan dana yang bisa digunakan"),"CC Info Tagihan dan Total Dana",
+                     np.where(gc_inquiry["intent"].str.contains("ID_AVAILABLELIMITCL") & gc_inquiry["requestText"].str.contains("START_KAI_GC"),"CL Card Status",
+                     np.where(gc_inquiry["intent"].str.contains("ID_CLSTATUSFINAL") & gc_inquiry["requestText"].str.contains("id_CLStatusFinal_fd"),"CL Card Status",
+                     np.where(gc_inquiry["intent"].str.contains("ID_AVAILABLELIMITCL|ID_CLSTATUSFINAL") & gc_inquiry["requestText"].str.contains("Informasi tagihan|Total pemakaian dan dana yang bisa digunakan"),"CL Info Tagihan dan Total Dana",
+                     np.where(gc_inquiry["intent"].str.contains("ID_PERSONALLOANSTATUS") & gc_inquiry["requestText"].str.contains("Sisa Pinjaman dan tenor|Informasi tagihan"),"PL Sisa Pinjaman dan Tenor",
+                              "")))))))
+
+# gc inquiry summary
+gc_inquiry_user_id = gc_inquiry.groupby(['userId'])[['userId']].count()
+gc_inquiry_user_id_count = len(gc_inquiry_user_id)
+
+gc_inquiry_session_id = gc_inquiry.groupby(['sessionId'])[['sessionId']].count()
+gc_inquiry_session_id_count = len(gc_inquiry_session_id)
+
+gc_inquiry_transcript = gc_inquiry['sessionId']
+gc_inquiry_transcript_count = len(gc_inquiry_transcript)
+
+gc_inquiry_flag = gc_inquiry[["flag","sessionId"]]
+gc_inquiry_flag = gc_inquiry_flag.loc[gc_inquiry_flag.flag != ""]
+gc_inquiry_flag = gc_inquiry_flag.groupby(['flag']).count()
+gc_inquiry_flag = gc_inquiry_flag.reset_index()
+gc_inquiry_flag = gc_inquiry_flag.rename(columns = {'flag': 'Inquiry','sessionId':'Vol'})
+
+gc_inquiry_flag_sum = gc_inquiry_flag["Vol"].sum()
+
+gc_inquiry_summary = {'Inquiry': ["Customer ID","Session ID","Total Transcript","GC Attempt"], 'Vol' : [gc_inquiry_user_id_count,
+                                                                           gc_inquiry_session_id_count,
+                                                                           gc_inquiry_transcript_count,
+                                                                           gc_inquiry_flag_sum]}
+gc_inquiry_summary = pd.DataFrame(data=gc_inquiry_summary)
+gc_inquiry_summary_final = pd.concat([gc_inquiry_summary,gc_inquiry_flag], ignore_index=True)
+
+
+#%% gc block & replace
+
+gc_blockreplace = gc_all.loc[gc_all["intent"].str.contains("_GC_BLOCKREPLACE|_GC_REPLACECARD|_BLOCKREPLACE|_REPLACE")]
+
+gc_blockreplace["flag"] = np.where(gc_blockreplace["intent"].str.contains("ID_CC_BLOCKREPLACE") & (gc_blockreplace["requestText"].str.contains("Lost / Stolen/ Retained at ATM")),"CC Block card due to lost/stolen",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CC_BLOCKREPLACE") & (gc_blockreplace["requestText"] == "Agree") & (gc_blockreplace["responseText"].str.contains(" telah berhasil diblokir ")),"CC Block card success",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CC_BLOCKREPLACE") & (gc_blockreplace["responseText"].str.contains("Saat ini pemblokiran kartu ")),"CC Block card due to other reason",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CC_BLOCKREPLACE") & (gc_blockreplace["responseText"].str.contains("Kartu yang kamu pilih tidak dapat diblokir")),"CC Card ineligible to be blocked",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CC_BLOCKREPLACE") & (gc_blockreplace["responseText"].str.contains("Pengajuan penggantian kartu telah diterima")),"CC Card success to be replaced",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CC_BLOCKREPLACE") & (gc_blockreplace["responseText"].str.contains("Kami akan membatalkan penggantian kartu kamu")),"CC Card not success to be replaced",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CC_REPLACE") & (gc_blockreplace["responseText"].str.contains("Pengajuan penggantian kartu telah diterima")),"CC Replace card success",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CC_REPLACE") & (gc_blockreplace["responseText"].str.contains("Pengajuan blokir kartu kamu gagal diproses")),"CC Replace card failed",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CC_REPLACE") & (gc_blockreplace["responseText"].str.contains("Kami akan membatalkan penggantian kartu kamu")),"CC Replace card - discontinue",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CC_REPLACE") & (gc_blockreplace["responseText"].str.contains("Tidak ada kartu yang bisa diganti")),"CC Card ineligible to be replaced",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CL_BLOCKREPLACE") & (gc_blockreplace["requestText"].str.contains("Lost / Stolen/ Retained at ATM")),"CL Block card due to lost/stolen",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CL_BLOCKREPLACE") & (gc_blockreplace["responseText"].str.contains("telah berhasil diblokir")),"CL Block card success",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CL_BLOCKREPLACE") & (gc_blockreplace["responseText"].str.contains("Saat ini pemblokiran kartu ")),"CL Block card due to other reason",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CL_BLOCKREPLACE") & (gc_blockreplace["responseText"].str.contains("Kartu yang kamu pilih tidak dapat diblokir")),"CL Card ineligible to be blocked",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CL_BLOCKREPLACE") & (gc_blockreplace["responseText"].str.contains("Pengajuan penggantian kartu telah diterima")),"CL Card success to be replaced",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CL_BLOCKREPLACE") & (gc_blockreplace["responseText"].str.contains("Kami akan membatalkan penggantian kartu kamu")),"CL Can't replace card due to invalid mailing address",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CL_REPLACE") & (gc_blockreplace["responseText"].str.contains("Pengajuan penggantian kartu telah diterima")),"CL Replace card success",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CL_REPLACE") & (gc_blockreplace["responseText"].str.contains("Pengajuan blokir kartu kamu gagal diproses")),"CL Replace card failed",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CL_REPLACE") & (gc_blockreplace["responseText"].str.contains("Kami akan membatalkan penggantian kartu kamu")),"CL Replace card - discontinue",
+                          np.where(gc_blockreplace["intent"].str.contains("ID_CL_REPLACE") & (gc_blockreplace["responseText"].str.contains("Tidak ada kartu yang bisa diganti")),"CL Card ineligible to be replaced",
+                                   ""))))))))))))))))))))
+
+# gc blockreplace summary
+gc_blockreplace_user_id = gc_blockreplace.groupby(['userId'])[['userId']].count()
+gc_blockreplace_user_id_count = len(gc_blockreplace_user_id)
+
+gc_blockreplace_session_id = gc_blockreplace.groupby(['sessionId'])[['sessionId']].count()
+gc_blockreplace_session_id_count = len(gc_blockreplace_session_id)
+
+gc_blockreplace_transcript = gc_blockreplace['sessionId']
+gc_blockreplace_transcript_count = len(gc_blockreplace_transcript)
+
+gc_blockreplace_flag = gc_blockreplace[["flag","sessionId"]]
+gc_blockreplace_flag = gc_blockreplace_flag.loc[gc_blockreplace_flag.flag != ""]
+gc_blockreplace_flag = gc_blockreplace_flag.groupby(['flag']).count()
+gc_blockreplace_flag = gc_blockreplace_flag.reset_index()
+gc_blockreplace_flag = gc_blockreplace_flag.rename(columns = {'flag': 'Block & Replacement','sessionId':'Vol'})
+
+gc_blockreplace_flag_sum = gc_blockreplace_flag["Vol"].sum()
+
+gc_blockreplace_summary = {'Block & Replacement': ["Customer ID","Session ID","Total Transcript","GC Attempt"], 'Vol' : [gc_blockreplace_user_id_count,
+                                                                           gc_blockreplace_session_id_count,
+                                                                           gc_blockreplace_transcript_count,
+                                                                           gc_blockreplace_flag_sum]}
+gc_blockreplace_summary = pd.DataFrame(data=gc_blockreplace_summary)
+gc_blockreplace_summary_final = pd.concat([gc_blockreplace_summary,gc_blockreplace_flag], ignore_index=True)
+
+
+#%% IA GC
+## ia call
+ia_gc_call = pd.read_pickle(r"\\10.232.27.11\cctr$\Report\00. Data Source\00_IA_OM_SMS\02_IA_Data_Set\01. PHONE\ia_phone_" + yesterday.strftime("%b%y")+ ".pkl", compression="zip")
+ia_gc_call = ia_gc_call.drop(columns=["PARTY_ID","Recipient","Subject","Owner","Due","Activity Status","Chat Session Id","Actual End","Actual Start","Segment","Created By From iServe","CRM IA No"])
+ia_gc_call = ia_gc_call.rename(columns = {'Phone Session ID': 'Session ID', 'Created By User':'Created By','Description':'Comments',
+                                          'Phone Call Type':'Type', 'Customer call purpose':'Sub Type'})
+ia_gc_call = ia_gc_call.loc[ia_gc_call['Direction'] != "Phone (Outbound)"]
+
+## ia chat
+ia_gc_chat = pd.read_pickle(r"\\10.232.27.11\cctr$\Report\00. Data Source\00_IA_OM_SMS\02_IA_Data_Set\02. CHAT\ia_chat_" + yesterday.strftime("%b%y")+ ".pkl", compression="zip")
+ia_gc_chat['IA Channel'] = np.where(pd.isna(ia_gc_chat['IA Channel']),ia_gc_chat['Channel'],ia_gc_chat['IA Channel'])
+ia_gc_chat = ia_gc_chat.drop(columns=['Activity Status','Start Date','Due','Owner','Assigned To Team','Segment','VA Chat Ref No','Channel'])
+ia_gc_chat = ia_gc_chat.rename(columns = {'Chat Session ID': 'Session ID','Chat Type':'Type','Chat Purpose':'Sub Type',
+                                          'Created By User':'Created By','Date Created':'Created On'})
+ia_gc_chat['Direction'] = "CHAT"
+
+
+ia_gc = pd.concat([ia_gc_call,ia_gc_chat], ignore_index=True)
+ia_gc = ia_gc.loc[~ia_gc['CIF ID'].isna()]
+ia_gc = ia_gc.loc[ia_gc['IA Channel'] == "CUSTOMER CENTRE"]
+
+Hastag = pd.melt(ia_gc, id_vars=['IA Number'],value_vars=['HASH_TAG'])
+Hastag['Label_indx'] =Hastag.groupby(['IA Number','variable']).cumcount()+1
+Hastag['Label'] = Hastag['variable'] + '_' + Hastag['Label_indx'].astype(str) 
+Hastag = Hastag.pivot(index='IA Number',columns='Label', values='value')
+Hastag = Hastag.reset_index()
+
+ia_gc = pd.merge(ia_gc,Hastag, how = 'left', 
+                           left_on = ['IA Number'],
+                           right_on = ['IA Number'])
+
+ia_gc = ia_gc.drop_duplicates(subset = ['IA Number'], keep = "first")
+
+filter_list = ["Credit Card | Enquiry (CCTR use) | Card Status",
+               "Credit Card | Enquiry (CCTR use) | Account Status",
+               "Credit Card | Enquiry (CCTR use) | Account Balance",
+               "Credit Card | Enquiry (CCTR use) | Available Limit",
+               "Cashline | Enquiry (CCTR use) | Card Status",
+               "Cashline | Enquiry (CCTR use) | Account Status",
+               "Cashline | Enquiry (CCTR use) | Account Balance",
+               "Cashline | Enquiry (CCTR use) | Available Limit",
+               "Personal Loan | Enquiry (CCTR use) | Loan Detail",
+               "Personal Loan | Enquiry (CCTR use) | MB - UL Loan Detail",
+               "Credit Card | Enquiry (CCTR use) | Block Card",
+               "Credit Card | Enquiry (CCTR use) | Block Card due to Lost/ Stolen",
+               "Cashline | Enquiry (CCTR use) | Block Card",
+               "Credit Card | Enquiry (CCTR use) | Supp - Block Card",
+               "Credit Card | Enquiry (CCTR use) | Card Replacement",
+               "Credit Card | Enquiry (CCTR use) | Supp - Card Replacement",
+               "Cashline | Enquiry (CCTR use) | Card Replacement",
+               "Credit Card | Enquiry (CCTR use) | Card Delivery",
+               "Credit Card | Enquiry (CCTR use) | MB CC Card Delivery",
+               "Credit Card | Enquiry (CCTR use) | Supp - Card Delivery",
+               "DigiBank | Digibank DC | Debit Card Delivery",
+               "Cashline | Enquiry (CCTR use) | Card Delivery Status",
+               "Debit Card | Enquiry (CCTR use) | Delivery Status"]
+ia_gc = ia_gc[ia_gc.LOV.isin(filter_list)]
+
+list_ia_inquiry = ["Credit Card | Enquiry (CCTR use) | Card Status",
+                    "Credit Card | Enquiry (CCTR use) | Account Status",
+                    "Credit Card | Enquiry (CCTR use) | Account Balance",
+                    "Credit Card | Enquiry (CCTR use) | Available Limit",
+                    "Cashline | Enquiry (CCTR use) | Card Status",
+                    "Cashline | Enquiry (CCTR use) | Account Status",
+                    "Cashline | Enquiry (CCTR use) | Account Balance",
+                    "Cashline | Enquiry (CCTR use) | Available Limit",
+                    "Personal Loan | Enquiry (CCTR use) | Loan Detail",
+                    "Personal Loan | Enquiry (CCTR use) | MB - UL Loan Detail"]
+
+list_ia_blockreplace = ["Credit Card | Enquiry (CCTR use) | Block Card",
+                        "Credit Card | Enquiry (CCTR use) | Block Card due to Lost/ Stolen",
+                        "Cashline | Enquiry (CCTR use) | Block Card",
+                        "Credit Card | Enquiry (CCTR use) | Supp - Block Card",
+                        "Credit Card | Enquiry (CCTR use) | Card Replacement",
+                        "Credit Card | Enquiry (CCTR use) | Supp - Card Replacement",
+                        "Cashline | Enquiry (CCTR use) | Card Replacement"]
+
+list_ia_delivery = ["Credit Card | Enquiry (CCTR use) | Card Delivery",
+                    "Credit Card | Enquiry (CCTR use) | MB CC Card Delivery",
+                    "Credit Card | Enquiry (CCTR use) | Supp - Card Delivery",
+                    "DigiBank | Digibank DC | Debit Card Delivery",
+                    "Cashline | Enquiry (CCTR use) | Card Delivery Status",
+                    "Debit Card | Enquiry (CCTR use) | Delivery Status"]
+
+ia_gc["Category"] = np.where(ia_gc["LOV"].isin(list_ia_inquiry), "IA GC Inquiry",
+                    np.where(ia_gc["LOV"].isin(list_ia_blockreplace), "IA GC Block & Replace",
+                    np.where(ia_gc["LOV"].isin(list_ia_delivery), "IA GC Card Delivery",
+                             "")))
+
+ia_gc['Comments'] = ia_gc['Comments'].str.lower()
+ia_gc['Check_'] = None
+ia_gc['Check_'] = np.where(pd.isna(ia_gc['Check_']) & (ia_gc["Comments"].str.contains("#reject", case = False, regex = True)),"DLP",
+                    np.where(pd.isna(ia_gc['Check_']) & (ia_gc["Comments"].str.contains("#fu", case = False, regex = True)),"DLP",
+                    None))
+
+try:
+    ia_gc['Check_'] = np.where(pd.isna(ia_gc['Check_']) & (ia_gc["HASH_TAG_1"].str.contains("#reject|#fu", case = False, regex = True)), 'DLP',ia_gc['Check_'])
+    ia_gc['Check_'] = np.where(pd.isna(ia_gc['Check_']) & (ia_gc["HASH_TAG_2"].str.contains("#reject|#fu", case = False, regex = True)), 'DLP',ia_gc['Check_'])
+    ia_gc['Check_'] = np.where(pd.isna(ia_gc['Check_']) & (ia_gc["HASH_TAG_3"].str.contains("#reject|#fu", case = False, regex = True)), 'DLP',ia_gc['Check_'])
+    ia_gc['Check_'] = np.where(pd.isna(ia_gc['Check_']) & (ia_gc["HASH_TAG_4"].str.contains("#reject|#fu", case = False, regex = True)), 'DLP',ia_gc['Check_'])
+    ia_gc['Check_'] = np.where(pd.isna(ia_gc['Check_']) & (ia_gc["HASH_TAG_5"].str.contains("#reject|#fu", case = False, regex = True)), 'DLP',ia_gc['Check_'])
+                              
+except Exception:
+    pass
+
+ia_gc = ia_gc.loc[ia_gc['Check_'] != "DLP"]
+ia_gc = ia_gc.drop(columns=['Check_','HASH_TAG'])
+ia_gc_count = len(ia_gc)
+ia_gc_summary = {'IA GC': ["IA Calls Related to GC"], 'Vol' : [ia_gc_count]}
+ia_gc_summary = pd.DataFrame(data=ia_gc_summary)
+
+
+ia_gc_category = ia_gc[["Category","IA Number"]]
+ia_gc_category = ia_gc_category.loc[ia_gc_category.Category != ""]
+ia_gc_category = ia_gc_category.groupby(['Category']).count()
+ia_gc_category = ia_gc_category.reset_index()
+ia_gc_category = ia_gc_category.rename(columns = {'Category': 'IA GC','IA Number':'Vol'})
+
+ia_gc_summary_final = pd.concat([ia_gc_summary,ia_gc_category], ignore_index=True)
+
+
+#%% Load Template and save it
+
+pth_template = r'\\10.232.27.11\cctr$\Report\Templates\template_gc.xlsx'
+# pth_drop_file = r'C:\Users\muhammad1\Documents\GC_' + yesterday.strftime('%Y%m') +'.xlsx'
+# pth_drop_file = r'C:\Users\cctrmis\DBS Bank Ltd\IDCCTR - Transformation Team (Archive) - 00. Service Improvement\MIS Report\TM_OM_ALL\Productivity\Agent_Productivity_' + yesterday.strftime('%Y%m') +'.xlsx'
+pth_drop_file = r'C:\Users\muhammad1\DBS Bank Ltd\IDCCTR - Transformation Team (Archive) - Old Sharepoint Service Improvement\00. Service Improvement\MIS Report\TM_OM_ALL\GC\GC_' + yesterday.strftime('%Y%m') +'.xlsx'
+
+wb = load_workbook(pth_template)
+
+# Assign Sheets
+ws1 = wb['GC_Inquiry_Summary']
+ws2 = wb['GC_BlockReplacement_Summary']
+ws3 = wb['GC_Delivery_Summary']
+ws4 = wb['GC_Inquiry']
+ws5 = wb['GC_BlockReplacement']
+ws6 = wb['GC_Delivery']
+ws7 = wb['IA_GC']
+ws8 = wb['IA_GC_Summary']
+
+# Dataframe To Worksheets
+for r in dataframe_to_rows(gc_inquiry_summary_final, index=False, header=False):
+      ws1.append(r)
+for r in dataframe_to_rows(gc_blockreplace_summary_final, index=False, header=False):
+      ws2.append(r)
+for r in dataframe_to_rows(gc_delivery_summary_final, index=False, header=False):
+      ws3.append(r)
+for r in dataframe_to_rows(gc_inquiry, index=False, header=False):
+      ws4.append(r)
+for r in dataframe_to_rows(gc_blockreplace, index=False, header=False):
+      ws5.append(r)
+for r in dataframe_to_rows(gc_delivery, index=False, header=False):
+      ws6.append(r)
+for r in dataframe_to_rows(ia_gc, index=False, header=False):
+      ws7.append(r)
+for r in dataframe_to_rows(ia_gc_summary_final, index=False, header=False):
+      ws8.append(r)
+
+
+# Save The Result
+wb.save(pth_drop_file)
+wb.close()
+
+
+#%% export
+
+pth_drop_file = r"C:\Users\muhammad1\DBS Bank Ltd\IDCCTR - Transformation Team - Documents\MIS\00. MIS DATA SOURCE\07. GC" + yesterday.strftime("\%m. ") + "GC_All_" + yesterday.strftime("%b %Y") + ".xlsx"
+
+#Fix Header [Dont Format]
+import pandas.io.formats.excel
+pandas.io.formats.excel.ExcelFormatter.header_style = None
+
+# Create a Pandas Excel writer using XlsxWriter as the engine.
+writer = pd.ExcelWriter(pth_drop_file, engine='xlsxwriter')
+
+# Write each dataframe to a different worksheet.
+# gc_inquiry_summary_final.to_excel(writer, sheet_name= "Summary",index=False)
+# gc_blockreplace_summary_final.to_excel(writer,sheet_name="Summary",index=False,startrow=0, startcol=4)
+# gc_delivery_summary_final.to_excel(writer,sheet_name="Summary",index=False,startrow=0, startcol=8)
+gc_all.to_excel(writer, sheet_name='GC_Raw',index=False)
+# gc_inquiry.to_excel(writer,sheet_name="GC_Inquiry",index=False)
+# gc_blockreplace.to_excel(writer,sheet_name="GC_BlockReplace",index=False)
+# gc_delivery.to_excel(writer,sheet_name="GC_Delivery",index=False)
+
+# Close the Pandas Excel writer and output the Excel file.
+# writer.save()
+writer.close()
+
+#%% export
+
+pth_drop_file = r"C:\Users\muhammad1\DBS Bank Ltd\IDCCTR - Transformation Team - Documents\MIS\00. MIS DATA SOURCE\07. GC" + yesterday.strftime("\%m. ") + "IA_GC_" + yesterday.strftime("%b %Y") + ".xlsx"
+
+#Fix Header [Dont Format]
+import pandas.io.formats.excel
+pandas.io.formats.excel.ExcelFormatter.header_style = None
+
+# Create a Pandas Excel writer using XlsxWriter as the engine.
+writer = pd.ExcelWriter(pth_drop_file, engine='xlsxwriter')
+
+# Write each dataframe to a different worksheet.
+# gc_inquiry_summary_final.to_excel(writer, sheet_name= "Summary",index=False)
+# gc_blockreplace_summary_final.to_excel(writer,sheet_name="Summary",index=False,startrow=0, startcol=4)
+# gc_delivery_summary_final.to_excel(writer,sheet_name="Summary",index=False,startrow=0, startcol=8)
+ia_gc.to_excel(writer, sheet_name='IA',index=False)
+# gc_inquiry.to_excel(writer,sheet_name="GC_Inquiry",index=False)
+# gc_blockreplace.to_excel(writer,sheet_name="GC_BlockReplace",index=False)
+# gc_delivery.to_excel(writer,sheet_name="GC_Delivery",index=False)
+
+# Close the Pandas Excel writer and output the Excel file.
+# writer.save()
+writer.close()
